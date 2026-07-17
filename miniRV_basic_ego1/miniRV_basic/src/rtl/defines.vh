@@ -6,16 +6,22 @@
 `define PC_INIT_VAL 32'h0
 
 `define ALU_ADD     5'h00
+`define ALU_SUB     5'h01  // a
 `define ALU_OR      5'h03
+`define ALU_XOR     5'h04  // a
 `define ALU_SLL     5'h05
+`define ALU_SRL     5'h06  // a
+`define ALU_SRA     5'h07  // a
 `define ALU_EQ      5'h08
 `define ALU_NE      5'h09
     
 `define NPC_PC4     2'b00
+`define NPC_JALR    2'b01  // a
 `define NPC_BRA     2'b10
 `define NPC_JMP     2'b11
     
 `define EXT_I       3'b000
+`define EXT_S       3'b001 // a
 `define EXT_B       3'b010
 `define EXT_U       3'b011
 `define EXT_J       3'b100
