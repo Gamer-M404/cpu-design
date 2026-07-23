@@ -85,10 +85,10 @@ module divider #(
                 end
 
                 DONE: begin
-                    // 原码 → 补码
-                    z    <= x_sign ^ y_sign ? (~{1'b0, quotient} + 1) : {1'b0, quotient};
-                    r    <= x_sign ? (~{1'b0, remainder[MAG_WID-1:0]} + 1) : {1'b0,
-                    remainder[MAG_WID-1:0]};
+                    // 商的符号 = 被除数符号 ^ 除数符号
+                    // 余数的符号 = 被除数符号
+                    z    <= {x_sign ^ y_sign, quotient};
+                    r    <= {x_sign, remainder[MAG_WID-1:0]};
                     busy <= 1'b0;
                     state <= IDLE;
                 end

@@ -23,10 +23,10 @@ module MEXT (
     // 即根据op，使用real_din产生ext
     always @(*) begin
         case (op)
-            `RAM_EXT_B : ext = 32'h0;
-            `RAM_EXT_BU: ext = 32'h0;
-            `RAM_EXT_H : ext = 32'h0;
-            `RAM_EXT_HU: ext = 32'h0;
+            `RAM_EXT_B : ext = {{24{real_din[7]}}, real_din[7:0]};
+            `RAM_EXT_BU: ext = {24'h0, real_din[7:0]};
+            `RAM_EXT_H : ext = {{16{real_din[15]}}, real_din[15:0]};
+            `RAM_EXT_HU: ext = {16'h0, real_din[15:0]};
             default    : ext = real_din;
         endcase
     end

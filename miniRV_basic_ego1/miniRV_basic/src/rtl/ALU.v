@@ -26,8 +26,22 @@ module ALU (
     always @(*) begin
         case (op_r != 4'h0 ? op_r : op)
             `ALU_ADD  : c = a + b;
+            `ALU_SUB  : c = a - b;
+            `ALU_AND  : c = a & b;
             `ALU_OR   : c = a | b;
+            `ALU_XOR  : c = a ^ b;
             `ALU_SLL  : c = a << b[4:0];
+            `ALU_SRL  : c = a >> b[4:0];
+            `ALU_SRA  : c = $signed(a) >>> b[4:0];
+            `ALU_SLT  : c = $signed(a) < $signed(b) ? 32'd1 : 32'd0 ;
+            `ALU_SLTU : c = a < b ? 32'd1 : 32'd0;
+            `ALU_MUL  : c = mul_res[31:0];
+            `ALU_MULH : c = mul_res[63:32];
+            `ALU_MULHU: c = mulu_res[63:32];
+            `ALU_DIV  : c = div_quo;
+            `ALU_DIVU : c = divu_quo;
+            `ALU_REM  : c = div_rem;
+            `ALU_REMU : c = divu_rem;
             default   : c = 32'h0;
         endcase
     end
@@ -36,16 +50,19 @@ module ALU (
         case (op)
             `ALU_EQ : br = a == b;
             `ALU_NE : br = a != b;
+            `ALU_LT : br = $signed(a) < $signed(b);
+            `ALU_LTU: br = a < b;
+            `ALU_GE : br = $signed(a) >= $signed(b);
+            `ALU_GEU: br = a >= b;
             default : br = 1'b0;
         endcase
     end
 
-    assign mul_flag  = 1'b0;
-    assign mulu_flag = 1'b0;
-    assign div_flag  = 1'b0;
-    assign divu_flag = 1'b0;
-    // assign busy      = mul_busy | mulu_busy | div_busy | divu_busy;
-    assign busy      = 1'b0;
+    assign mul_flag  = (op == `ALU_MUL || op == `ALU_MULH) && !mul_busy;
+    assign mulu_flag = (op == `ALU_MULHU) && !mulu_busy;
+    assign div_flag  = (op == `ALU_DIV  || op == `ALU_REM) && !div_busy;
+    assign divu_flag = (op == `ALU_DIVU || op == `ALU_REMU)&& !divu_busy;
+    assign busy      = mul_busy | mulu_busy | div_busy | divu_busy;
 
     always @(posedge clk) begin
         if (mul_flag | mulu_flag | div_flag | divu_flag)

@@ -12,6 +12,7 @@ module SEXT (
             `EXT_B : ext = {{19{imm[31]}}, imm[31], imm[7], imm[30:25], imm[11:8], 1'b0};
             `EXT_U : ext = {imm[31:12], 12'h0};
             `EXT_J : ext = {{11{imm[31]}}, imm[31], imm[19:12], imm[20], imm[30:21], 1'b0};
+            `EXT_S : ext = {{20{imm[31]}}, imm[31:25], imm[11:7]};
             default: ext = 32'h0;
         endcase
     end
