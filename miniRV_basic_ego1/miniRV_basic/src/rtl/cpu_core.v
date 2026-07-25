@@ -46,7 +46,7 @@ module cpu_core(
     assign pc4 = pc + 32'h4;
 
     wire if_stall;
-    assign if_stall = !ifetch_valid | pipe_stall;
+    assign if_stall = !ifetch_valid | pipe_stall | ex_stall;
 
     wire [31:0] if_inst;
     assign if_inst = ifetch_valid ? ifetch_inst : 32'h13;
@@ -177,7 +177,7 @@ module cpu_core(
     pipeline_reg #(.WIDTH(ID_EX_WID)) U_ID_EX (
         .clk      (cpu_clk),
         .rst      (cpu_rst),
-        .stall    (1'b0),
+        .stall    (ex_stall),
         .flush    (flush_id_ex | pipe_stall),
         .din      (id_ex_din),
         .dout     (id_ex_dout)
@@ -235,11 +235,39 @@ module cpu_core(
     wire [31:0] alu_c;
     wire        br;
     wire        mul_div_busy;
+    
+    // 多周期EX：乘除法指令需 32+ 周期，只停 IF/ID 和 ID/EX
+    // EX/MEM 不停（前面指令正常流出），期间向 EX/MEM 插 NOP
+    wire ex_is_multi_cycle = (ex_alu_op == `ALU_MUL)  || (ex_alu_op == `ALU_MULH) ||
+                             (ex_alu_op == `ALU_MULHU) || (ex_alu_op == `ALU_DIV)  ||
+                             (ex_alu_op == `ALU_DIVU)  || (ex_alu_op == `ALU_REM)  ||
+                             (ex_alu_op == `ALU_REMU);
+
+    // 用 multi_started 而非 multi_active，确保背靠背乘除法能正确区分
+    reg multi_started;
+    wire multi_done;
+    always @(posedge cpu_clk or posedge cpu_rst) begin
+        if (cpu_rst)
+            multi_started <= 1'b0;
+        else if (ex_is_multi_cycle && !multi_started)
+            multi_started <= 1'b1;       // 新乘除法指令进入 EX
+        else if (multi_done)
+            multi_started <= 1'b0;       // 计算完成
+    end
+    assign multi_done = multi_started && !mul_div_busy;
+
+    // 仅停 IF/ID 和 ID/EX（锁住乘除法指令在 EX）
+    wire ex_stall;
+    assign ex_stall = (ex_is_multi_cycle && !multi_started) || mul_div_busy;
+
+    // 完成周期阻止 ALU 的 mul_flag 重新触发（否则 op_r 被重复锁存）
+    wire [4:0] alu_op_fixed;
+    assign alu_op_fixed = multi_done ? `ALU_ADD : ex_alu_op;
 
     ALU U_ALU (
         .rst        (cpu_rst),
         .clk        (cpu_clk),
-        .op         (ex_alu_op),
+        .op         (alu_op_fixed),
         .a          (alu_a),
         .b          (alu_b),
         .br         (br),
@@ -277,21 +305,22 @@ module cpu_core(
     wire [EX_MEM_WID-1:0] ex_mem_din;
     wire [EX_MEM_WID-1:0] ex_mem_dout;
 
-    assign ex_mem_din = {
-        ex_rd,
-        ex_ext,
-        ex_pc4,
-        alu_c,
-        ex_rf_we,
-        ex_rf_wsel,
-        ex_ram_rop,
-        ex_ram_wop
+    // 乘除法计算期间向 EX/MEM 插入气泡（NOP，rf_we=0）
+    // 计算期间向 EX/MEM 插入 NOP，完成时才放正确 alu_c
+    wire [EX_MEM_WID-1:0] ex_mem_din_multi;
+    assign ex_mem_din_multi = {
+        ex_rd, ex_ext, ex_pc4, alu_c,
+        ex_rf_we, ex_rf_wsel, ex_ram_rop, ex_ram_wop
     };
+    wire [EX_MEM_WID-1:0] ex_mem_din_nop = {EX_MEM_WID{1'b0}};
+
+    assign ex_mem_din = (ex_is_multi_cycle && !multi_done)
+                        ? ex_mem_din_nop : ex_mem_din_multi;
 
     pipeline_reg #(.WIDTH(EX_MEM_WID)) U_EX_MEM (
         .clk      (cpu_clk),
         .rst      (cpu_rst),
-        .stall    (1'b0),
+        .stall    (1'b0),         // EX/MEM 不停，让前面指令正常流出
         .flush    (1'b0),
         .din      (ex_mem_din),
         .dout     (ex_mem_dout)
@@ -361,6 +390,7 @@ module cpu_core(
         .ext        (ram_ext)
     );
 
+
     // ---- MEM/WB 数据选择 ----
     // load: 写回 ram_ext（从内存读出的数据）
     // 其他: 写回 mem_alu_c（ALU 结果）
@@ -425,6 +455,7 @@ module cpu_core(
         endcase
     end
 
+
     // ============================================================
     // PC & Redirect
     // ============================================================
@@ -440,7 +471,8 @@ module cpu_core(
 
     // Redirects must always update PC, even during an IF stall
     wire pc_fetch;
-    assign pc_fetch = (!if_stall && !pipe_stall) | jal_redirect | br_redirect | jalr_redirect;
+    assign pc_fetch = (!if_stall && !pipe_stall && !ex_stall) 
+                    | jal_redirect | br_redirect | jalr_redirect;
 
     PC U_PC (
         .clk        (cpu_clk),
