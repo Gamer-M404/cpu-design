@@ -31,6 +31,10 @@ module cpu_core(
     wire flush_if_id;
     wire flush_id_ex;
 
+    // 为 load-use 冒险准备停滞
+    wire pipe_stall;
+    assign pipe_stall = load_use_hazard;
+
     // ============================================================
     // IF Stage
     // ============================================================
@@ -41,11 +45,8 @@ module cpu_core(
     assign ifetch_addr = pc;
     assign pc4 = pc + 32'h4;
 
-    // inst_valid is registered (1-cycle latency from Inst_ROM).
-    // Stall IF/ID and PC during the first cycle after reset
-    // when the instruction is not yet valid.
     wire if_stall;
-    assign if_stall = !ifetch_valid;
+    assign if_stall = !ifetch_valid | pipe_stall;
 
     wire [31:0] if_inst;
     assign if_inst = ifetch_valid ? ifetch_inst : 32'h13;
@@ -65,7 +66,25 @@ module cpu_core(
     wire [31:0] id_pc   = if_id_dout[95:64];
     wire [31:0] id_pc4  = if_id_dout[63:32];
     wire [31:0] id_inst = if_id_dout[31:0];
+    
 
+    // 获取更多有关寄存器的信息以判断冒险
+    wire [4:0] id_rs1 = id_inst[19:15];
+    wire [4:0] id_rs2 = id_inst[24:20];
+    wire [4:0] id_rd = id_inst[11:7];
+
+    wire [6:0] id_opcode = id_inst[6:0];
+
+    // 是否要读寄存器1，2
+    wire id_rf1;
+    assign id_rf1 = !(id_opcode == 7'b0110111 ||   // LUI
+                    id_opcode == 7'b0010111 ||   // AUIPC
+                    id_opcode == 7'b1101111);    // JAL
+
+    wire id_rf2;
+    assign id_rf2 = (id_opcode == 7'b0110011) ||   // R-type
+                    (id_opcode == 7'b1100011) ||   // B-type (BEQ, BNE, etc.)
+                    (id_opcode == 7'b0100011);     // S-type (SW, SB, SH)
     // ============================================================
     // ID Stage
     // ============================================================
@@ -141,8 +160,8 @@ module cpu_core(
     assign id_ex_din = {
         id_inst[11:7],
         ext,
-        rf_rd2,
-        rf_rd1,
+        op_datB,
+        op_datA,
         id_pc4,
         id_pc,
         rf_we,
@@ -159,7 +178,7 @@ module cpu_core(
         .clk      (cpu_clk),
         .rst      (cpu_rst),
         .stall    (1'b0),
-        .flush    (flush_id_ex),
+        .flush    (flush_id_ex | pipe_stall),
         .din      (id_ex_din),
         .dout     (id_ex_dout)
     );
@@ -184,6 +203,29 @@ module cpu_core(
     wire [ 2:0] ex_ram_rop  = id_ex_dout[6:4];
     wire [ 3:0] ex_ram_wop  = id_ex_dout[3:0];
 
+
+    // 从流水寄存器中获取操作寄存器信息
+    wire [4:0] id_ex_rd = id_ex_dout[183:179];
+    wire       id_ex_rf_we = id_ex_dout[18];
+    wire [1:0] id_ex_rf_wsel = id_ex_dout[17:16];   // EX 段指令的写回选择
+
+
+    // 判断数据冒险
+    wire rs1_ex_hazard;
+    wire rs2_ex_hazard;
+    assign rs1_ex_hazard = (id_ex_rd == id_rs1) & id_ex_rf_we & id_rf1 & (id_ex_rd != 5'h0);
+    assign rs2_ex_hazard = (id_ex_rd == id_rs2) & id_ex_rf_we & id_rf2 & (id_ex_rd != 5'h0);
+    
+    // 判断load-use 冒险
+    wire [2:0] id_ex_ram_rop = id_ex_dout[6:4];
+
+    wire load_use_hazard;
+    assign load_use_hazard = 
+        (id_ex_ram_rop != `RAM_EXT_N) &&
+        (id_ex_rd != 5'h0)            &&
+        ((id_ex_rd == id_rs1 & id_rf1) ||
+         (id_ex_rd == id_rs2 & id_rf2));
+
     // ALU
     wire [31:0] alu_a;
     wire [31:0] alu_b;
@@ -203,6 +245,24 @@ module cpu_core(
         .br         (br),
         .c          (alu_c),
         .busy       (mul_div_busy)
+    );
+
+    // ---- 访存请求：在 EX 阶段发出，MEM 阶段数据就绪 ----
+    // DRAM 为寄存器输出（1 拍延迟），提前到 EX 发请求以消除停顿
+    wire [ 3:0] da_ren;
+    wire [31:0] da_addr;
+    wire [ 3:0] da_wen;
+    wire [31:0] da_wdata;
+
+    MREQ U_MEM_REQ (
+        .ram_addr   (alu_c),        // EX 阶段 ALU 结果 = 访存地址
+        .ram_rop    (ex_ram_rop),   // EX 阶段 load 类型
+        .ram_wop    (ex_ram_wop),   // EX 阶段 store 类型
+        .ram_wdata  (ex_rf_rd2),    // EX 阶段 store data（已前推）
+        .da_ren     (da_ren),
+        .da_addr    (da_addr),
+        .da_wen     (da_wen),
+        .da_wdata   (da_wdata)
     );
 
     // Branch target & redirect (EX stage)
@@ -250,43 +310,63 @@ module cpu_core(
     wire [ 2:0] mem_ram_rop = ex_mem_dout[6:4];
     wire [ 3:0] mem_ram_wop = ex_mem_dout[3:0];
 
-    // MREQ: 访存请求 → 总线协议翻译
-    wire [ 3:0] da_ren;
-    wire [31:0] da_addr;
-    wire [ 3:0] da_wen;
-    wire [31:0] da_wdata;
+    // 检测数据冒险用
+    wire [4:0] ex_mem_rd    = ex_mem_dout[110:106];
+    wire       ex_mem_rf_we = ex_mem_dout[9];
 
-    MREQ U_MEM_REQ (
-        .ram_addr   (mem_alu_c),
-        .ram_rop    (mem_ram_rop),
-        .da_ren     (da_ren),
-        .da_addr    (da_addr),
-        .ram_wop    (mem_ram_wop),
-        .ram_wdata  (32'h0),
-        .da_wen     (da_wen),
-        .da_wdata   (da_wdata)
-    );
+    wire rs1_mem_hazard;
+    wire rs2_mem_hazard;
+    assign rs1_mem_hazard = (ex_mem_rd == id_rs1) & ex_mem_rf_we & id_rf1 & (ex_mem_rd != 5'h0);
+    assign rs2_mem_hazard = (ex_mem_rd == id_rs2) & ex_mem_rf_we & id_rf2 & (ex_mem_rd != 5'h0);
 
+    // ---- 根据 producer 的 rf_wsel 选择正确的前推数据 ----
+    // 情形 A: producer 在 EX，根据 id_ex_rf_wsel 选
+    wire [31:0] ex_fwd_data;
+    assign ex_fwd_data = (id_ex_rf_wsel == `WB_ALU) ? alu_c                :
+                         (id_ex_rf_wsel == `WB_PC4) ? id_ex_dout[82:51]  : // ex_pc4
+                         (id_ex_rf_wsel == `WB_EXT) ? id_ex_dout[178:147]: // ex_ext
+                         (id_ex_rf_wsel == `WB_RAM) ? 32'h0 :  // load: 数据未就绪，由 stall 处理
+                                                      alu_c;    // 默认
+
+    // 情形 B: producer 在 MEM，根据 mem_rf_wsel 选
+    wire [31:0] mem_fwd_data;
+    assign mem_fwd_data = (mem_rf_wsel == `WB_ALU) ? mem_alu_c  :
+                          (mem_rf_wsel == `WB_PC4) ? mem_pc4    :
+                          (mem_rf_wsel == `WB_EXT) ? mem_ext    :
+                          (mem_rf_wsel == `WB_RAM) ? ram_ext    :  // load: 前推内存数据
+                                                     mem_alu_c;    // 默认
+
+    // ---- 前推 MUX ----
+    // rs1的数据前递
+    wire [31:0] op_datA;
+    assign op_datA = rs1_ex_hazard ? ex_fwd_data :
+                     rs1_mem_hazard ? mem_fwd_data :
+                     rs1_wb_hazard ? rf_wD :
+                                     rf_rd1;
+
+    // rs2的数据前递
+    wire [31:0] op_datB;
+    assign op_datB = rs2_ex_hazard ? ex_fwd_data :
+                     rs2_mem_hazard ? mem_fwd_data :
+                     rs2_wb_hazard ? rf_wD :
+                                     rf_rd2;
     // MEXT: 总线返回数据 → 对齐 + 符号扩展
+    // daccess_rdata 在 MEM 阶段已就绪（DRAM 读在 EX→MEM posedge 完成）
     wire [31:0] ram_ext;
-    reg  [ 2:0] mem_ram_rop_r;
-    reg  [31:0] mem_alu_c_r;
 
     MEXT U_MEM_EXT (
-        .op         (mem_ram_rop_r),
-        .din        (daccess_rdata),
-        .byte_offs  (mem_alu_c_r[1:0]),
+        .op         (mem_ram_rop),       // 当前 load 类型
+        .din        (daccess_rdata),     // DRAM 返回数据（EX 阶段已发出读请求）
+        .byte_offs  (mem_alu_c[1:0]),
         .ext        (ram_ext)
     );
 
-    // 保留读类型和地址偏移，供 MEXT 在总线返回时使用
-    wire is_ld_st = (mem_ram_rop != `RAM_EXT_N) | (mem_ram_wop != `RAM_WE_N);
-    always @(posedge cpu_clk) begin
-        if (is_ld_st) begin
-            mem_ram_rop_r <= mem_ram_rop;
-            mem_alu_c_r   <= mem_alu_c;
-        end
-    end
+    // ---- MEM/WB 数据选择 ----
+    // load: 写回 ram_ext（从内存读出的数据）
+    // 其他: 写回 mem_alu_c（ALU 结果）
+    wire [31:0] mem_wb_data;
+    assign mem_wb_data = (mem_ram_rop != `RAM_EXT_N) ? ram_ext : mem_alu_c;
+
 
     // MEM/WB Pipeline Register
     wire [MEM_WB_WID-1:0] mem_wb_din;
@@ -296,7 +376,7 @@ module cpu_core(
         mem_rd,
         mem_ext,
         mem_pc4,
-        mem_alu_c,
+        mem_wb_data,    // ← load=ram_ext, ALU=mem_alu_c
         mem_rf_we,
         mem_rf_wsel
     };
@@ -319,7 +399,18 @@ module cpu_core(
     wire [31:0] wb_pc4     = mem_wb_dout[66:35];
     wire [31:0] wb_alu_c   = mem_wb_dout[34:3];
     wire        wb_rf_we   = mem_wb_dout[2];
-    wire [ 1:0] wb_rf_wsel = mem_wb_dout[1:0];
+    wire [ 1:0] wb_rf_wsel = mem_wb_dout[1:0]; 
+
+
+    // 检测数据冒险用
+    wire [4:0] mem_wb_rd = mem_wb_dout[103:99];
+    wire    mem_wb_rf_we = mem_wb_dout[2];
+
+    wire rs1_wb_hazard;
+    wire rs2_wb_hazard;
+    assign rs1_wb_hazard = (mem_wb_rd == id_rs1) & mem_wb_rf_we & id_rf1 & (mem_wb_rd != 5'h0);
+    assign rs2_wb_hazard = (mem_wb_rd == id_rs2) & mem_wb_rf_we & id_rf2 & (mem_wb_rd != 5'h0);
+
 
     assign rf_we1 = wb_rf_we;
     assign rf_wR  = wb_rd;
@@ -327,6 +418,7 @@ module cpu_core(
     always @(*) begin
         case (wb_rf_wsel)
             `WB_ALU: rf_wD = wb_alu_c;
+            `WB_RAM: rf_wD = wb_alu_c;   // load 数据存在 alu_c 字段
             `WB_PC4: rf_wD = wb_pc4;
             `WB_EXT: rf_wD = wb_ext;
             default: rf_wD = 32'h0;
@@ -348,7 +440,7 @@ module cpu_core(
 
     // Redirects must always update PC, even during an IF stall
     wire pc_fetch;
-    assign pc_fetch = !if_stall | jal_redirect | br_redirect | jalr_redirect;
+    assign pc_fetch = (!if_stall && !pipe_stall) | jal_redirect | br_redirect | jalr_redirect;
 
     PC U_PC (
         .clk        (cpu_clk),
@@ -361,13 +453,26 @@ module cpu_core(
     // ============================================================
     // Data Access Interface — 连接到总线
     // ============================================================
+    // daccess_addr: load 用组合逻辑（EX 阶段立即读），store 用寄存器（保持到 MEM 写完成）
+    reg [31:0] daccess_addr_s;
+    always @(posedge cpu_clk) begin
+        if (da_wen != 4'h0)
+            daccess_addr_s <= da_addr;   // 保存 store 地址
+    end
+    always @(*) begin
+        // store 在 MEM 时使用寄存器地址，否则使用组合逻辑地址
+        daccess_addr = cpu_rst ? 32'h0 :
+                       (daccess_wen != 4'h0) ? daccess_addr_s : da_addr;
+    end
+
+    // daccess_ren/wen/wdata: 寄存器（对齐黄金模型 MEM 阶段时序）
     always @(posedge cpu_clk or posedge cpu_rst) begin
         if (cpu_rst) begin
             daccess_ren   <= 4'h0;
             daccess_wen   <= 4'h0;
+            daccess_wdata <= 32'h0;
         end else begin
             daccess_ren   <= da_ren;
-            daccess_addr  <= da_addr;
             daccess_wen   <= da_wen;
             daccess_wdata <= da_wdata;
         end
