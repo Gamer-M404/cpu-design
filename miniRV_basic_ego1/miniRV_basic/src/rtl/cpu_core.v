@@ -104,7 +104,7 @@ module cpu_core(
         .rR2    (id_rs2),
         .rD1    (rf_rd1_raw),
         .rD2    (rf_rd2_raw),
-        .we     (mw_rf_we_actual),
+        .we     (rf_we_gated),
         .wR     (mw_rd),
         .wD     (mw_wb_data)
     );
@@ -195,20 +195,11 @@ module cpu_core(
             load_use_stall_r <= load_use_hazard;
     end
 
-    reg mul_div_stall_flag;
-    always @(posedge cpu_clk or posedge cpu_rst) begin
-        if (cpu_rst)
-            mul_div_stall_flag <= 1'b0;
-        else if (ex_flush)
-            mul_div_stall_flag <= 1'b0;
-        else if (id_is_mul_div && !stall_if_id)
-            mul_div_stall_flag <= 1'b1;
-        else if (!mul_div_busy)
-            mul_div_stall_flag <= 1'b0;
-    end
-
+    // Mul/div stall: freeze EX/MEM, MEM/WB, and ID/EX while a multi-cycle
+    // op is in EX.  Combinational detection avoids the 1-cycle gap of
+    // registered pre-stall and handles back-to-back mul/div correctly.
+    wire stall_all      = de_is_mul_div && (mul_div_busy || !mul_div_active);
     wire stall_load_use = load_use_hazard || load_use_stall_r;
-    wire stall_all      = mul_div_stall_flag;
     wire stall_if_id    = stall_all || stall_load_use;
     wire flush_id_ex    = stall_load_use || ex_flush;
 
@@ -228,8 +219,7 @@ module cpu_core(
     // Pause fetch only on the FIRST load-use stall cycle.
     // On the second cycle, start fetch early so the next instruction
     // is ready when the stall ends (no extra bubble).
-    wire pause_ifetch = stall_all || (de_is_mul_div && mul_div_busy) ||
-                        load_use_hazard || ex_flush;
+    wire pause_ifetch = stall_all || load_use_hazard || ex_flush;
     assign ifetch_req  = !pause_ifetch;
     assign ifetch_addr = ex_bj_f ? ex_bj_target : pc;
 
@@ -335,16 +325,18 @@ module cpu_core(
     wire [31:0] alu_c;
     wire        alu_br;
     wire        mul_div_busy;
+    wire        mul_div_active;
 
     ALU U_ALU (
-        .rst    (cpu_rst),
-        .clk    (cpu_clk),
-        .op     (de_alu_op),
-        .a      (alu_a),
-        .b      (alu_b),
-        .br     (alu_br),
-        .c      (alu_c),
-        .busy   (mul_div_busy)
+        .rst            (cpu_rst),
+        .clk            (cpu_clk),
+        .op             (de_alu_op),
+        .a              (alu_a),
+        .b              (alu_b),
+        .br             (alu_br),
+        .c              (alu_c),
+        .busy           (mul_div_busy),
+        .mul_div_active (mul_div_active)
     );
 
     // MREQ uses EX-stage signals so memory request is ready at start of MEM
@@ -372,12 +364,13 @@ module cpu_core(
         .ext        (ram_ext)
     );
 
-    // Bus interface
+    // Bus interface — freeze during mul/div stall so a load in MEM
+    // doesn't have its DRAM request overwritten by the EX-stage instruction.
     always @(posedge cpu_clk or posedge cpu_rst) begin
         if (cpu_rst) begin
             daccess_ren <= 4'h0;
             daccess_wen <= 4'h0;
-        end else begin
+        end else if (!stall_all) begin
             daccess_ren   <= da_ren;
             daccess_addr  <= da_addr;
             daccess_wen   <= da_wen;
@@ -504,9 +497,38 @@ module cpu_core(
 
     wire mw_rf_we_actual = mw_rf_we && (mw_rd != 5'h0);
 
+    // Prevent repeated RF write / debug event during mul/div stall.
+    // MEM/WB is frozen by stall_all, so the same writeback would appear
+    // every cycle.  wb_done is set on the first stall cycle to suppress
+    // subsequent cycles.  It resets when MW updates (stall_all deasserts).
+    reg wb_done;
+    always @(posedge cpu_clk or posedge cpu_rst) begin
+        if (cpu_rst)
+            wb_done <= 1'b0;
+        else if (!stall_all)
+            wb_done <= 1'b0;
+        else if (stall_all && !wb_done)
+            wb_done <= 1'b1;
+    end
+
+    wire rf_we_gated = mw_rf_we_actual && !wb_done;
+
     //==========================================================================
     // Debug / Trace Signals
     //==========================================================================
+    // Pipeline state debug — always present (used by test.cpp debug prints)
+    wire [31:0] debug_id_pc  /* verilator public */ ;
+    wire [ 4:0] debug_id_rd  /* verilator public */ ;
+    wire [31:0] debug_ex_pc  /* verilator public */ ;
+    wire [ 4:0] debug_ex_rd  /* verilator public */ ;
+    wire [ 4:0] debug_mem_rd /* verilator public */ ;
+
+    assign debug_id_pc  = fd_pc;
+    assign debug_id_rd  = id_rd;
+    assign debug_ex_pc  = de_pc;
+    assign debug_ex_rd  = de_rd;
+    assign debug_mem_rd = em_rd;
+
 `ifdef RUN_TRACE
     wire [31:0] debug_wb_pc    /* verilator public */ ;
     wire        debug_wb_rf_we /* verilator public */ ;
@@ -518,10 +540,12 @@ module cpu_core(
     wire [31:0] debug_mem_waddr /* verilator public */ ;
     wire [31:0] debug_mem_wdata /* verilator public */ ;
 
-    assign debug_wb_pc    = mw_pc;
-    assign debug_wb_rf_we = mw_rf_we_actual;
-    assign debug_wb_rf_wR = mw_rd;
-    assign debug_wb_rf_wD = mw_wb_data;
+    // Gate WB debug signals so a writeback frozen in MEM/WB during
+    // mul/div stall is reported only once, not every stalled cycle.
+    assign debug_wb_pc    = rf_we_gated ? mw_pc      : 32'h0;
+    assign debug_wb_rf_we = rf_we_gated;
+    assign debug_wb_rf_wR = rf_we_gated ? mw_rd      : 5'h0;
+    assign debug_wb_rf_wD = rf_we_gated ? mw_wb_data : 32'h0;
 
     assign debug_mem_pc    = em_pc;
     assign debug_mem_we    = daccess_wen;

@@ -11,7 +11,8 @@ module ALU (
     
     output reg  [31:0]  c,
     output reg          br,
-    output wire         busy
+    output wire         busy,
+    output wire         mul_div_active
 );
 
     wire        mul_flag, mulu_flag;
@@ -58,11 +59,12 @@ module ALU (
         endcase
     end
 
-    assign mul_flag  = (op == `ALU_MUL || op == `ALU_MULH) && !mul_busy;
-    assign mulu_flag = (op == `ALU_MULHU) && !mulu_busy;
-    assign div_flag  = (op == `ALU_DIV  || op == `ALU_REM) && !div_busy;
-    assign divu_flag = (op == `ALU_DIVU || op == `ALU_REMU)&& !divu_busy;
+    assign mul_flag  = (op == `ALU_MUL || op == `ALU_MULH) && !mul_busy && (op_r == 5'h0);
+    assign mulu_flag = (op == `ALU_MULHU) && !mulu_busy && (op_r == 5'h0);
+    assign div_flag  = (op == `ALU_DIV  || op == `ALU_REM) && !div_busy && (op_r == 5'h0);
+    assign divu_flag = (op == `ALU_DIVU || op == `ALU_REMU)&& !divu_busy && (op_r == 5'h0);
     assign busy      = mul_busy | mulu_busy | div_busy | divu_busy;
+    assign mul_div_active = |op_r;
 
     always @(posedge clk) begin
         if (mul_flag | mulu_flag | div_flag | divu_flag)
